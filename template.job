@@ -22,7 +22,7 @@
 source $(conda info --base)/etc/profile.d/conda.sh
 conda deactivate
 export PATH=$HOME/miniconda3/bin:$PATH
-conda activate ENVIRONMENT || exit 1
+conda activate test-project || exit 1
 
 export NUMBA_NUM_THREADS=RUNCPUS  # numba
 export OMP_NUM_THREADS=RUNCPUS    # openBLAS
