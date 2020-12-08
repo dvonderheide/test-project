@@ -1,0 +1,127 @@
+#!/usr/bin/env bash
+
+# This script is intended to be used with a cluster utilizing the LSF
+# scheduling system, specifically the Massachusetts Green High
+# Performance Computing Center (MGHPCC).
+
+#BSUB -W WALLTIME:00
+#BSUB -n RUNCPUS
+#BSUB -R 'rusage[mem=8000]'
+#BSUB -R 'span[hosts=1]'
+#BSUB -q long
+#BSUB -J "array[1-NUMJOBS]"
+#BSUB -o job_out/output.%I
+#BSUB -e job_out/error.%I
+
+# Automatically generated job file
+# user: USER
+#  dir: SCRIPTDIR
+# git versioning:
+#  submission_framework:  FRAMEVERSION
+#  simulation: SIMVERSION
+
+
+source deactivate
+export PATH=$HOME/miniconda3/bin:$PATH
+source activate ENVIRONMENT || exit 1
+
+export NUMBA_NUM_THREADS=RUNCPUS  # numba
+export OMP_NUM_THREADS=RUNCPUS    # openBLAS
+export MKL_NUM_THREADS=RUNCPUS    # intel
+
+# #========================================================================= ##
+## Setup constant values for the script
+job_path=JOBPATH
+cd $job_path
+command -v realpath > /dev/null 2>&1 && job_path=$(realpath --relative-to=$PWD $job_path)
+err_path=$job_path/err
+out_path=$job_path/out
+data_path=$job_path/data
+job_list=$job_path/run_list.txt
+param_list=$job_path/parameters.csv
+param_header=$(sed -n 2p $param_list)
+nsims=$(wc -l < $job_list)
+lockfile=$job_path/JOBNAME.lock
+fcount=$job_path/JOBNAME.count
+runscript=$job_path/run_cfg_sus.py
+python_script=$job_path/PYSCRIPT
+lock_fd=200
+allowed_time=ALLOWANCE
+SECONDS=-10
+
+headers=($(sed 's/,/ /g' <(head -n1 $param_list)))
+
+## ========================================================================= ##
+## Prepare locking functions, and setup locking
+_stop_locking() { flock -u $lock_fd; flock -xn $lock_fd && rm -f $lockfile; }
+_prepare_lock() { eval "exec $lock_fd> $lockfile"; }
+
+lock() { flock -xw 180 $lock_fd && return 0 || return 1; }
+unlock() { flock -u $lock_fd; }
+
+_prepare_lock  # Don't forget this!
+## ========================================================================= ##
+## Additional functions for cleaning up main body
+setup_and_run_sim() {
+  local n=$1
+  n=$(sed -n ${n}p $job_list)
+  local line=$((n+2))  # skip the header lines
+  local run_params=$(sed -n ${line}p $param_list)
+  local run_n=$(printf %06d $(echo $run_params | cut -f1 -d','))
+
+  local out_file=$job_path/out/run_${run_n}.log
+  local err_file=$job_path/err/run_${run_n}.err
+
+  echo -n "START:$run_n"
+  echo "Starting run $run..." > $err_file
+  cd $job_path
+  echo "python $python_script -p $param_header $run_params -o $job_path/data/run_$run_n" > $out_file
+  python $python_script -p $param_header $run_params -o $job_path/data/run_$run_n >> $out_file 2>> $err_file
+  echo "Completed run $run with exit code $?" >> $err_file
+  if grep -q 'KeyboardInterrupt' $err_file; then  # ghpcc sends sigint to stop jobs
+    pyexit=1
+  else
+    pyexit=0
+  fi
+  return $pyexit
+}
+
+
+## ========================================================================= ##
+## MAIN SCRIPT EXECUTION
+# These should already exist via make_job, but in case they don't.
+mkdir -p $out_path $err_path $data_path
+
+nolock_count=0
+# Note: could use 'times' to get cputime, but that's complicated. This isn't.
+while [[ $allowed_time -gt $SECONDS ]]; do
+  if lock; then
+    n=$(cat $fcount)
+    if [[ $n -gt $nsims ]]; then
+      echo "All runs accounted for"
+      exit 0
+    fi
+    echo $((n+1)) > $fcount
+    unlock
+    nolock_count=0
+
+    # run=$(sed -n "${n}p" $job_list)
+    setup_and_run_sim $n
+    pyexit=$?
+
+    [[ $pyexit -ne 0 ]] && exitout='EXIT' || exitout='COMPLETE'
+    echo ":$exitout:$pyexit"
+    [[ $pyexit -ne 0 ]] && exit 1
+    # exit 0  # one run per job
+  else
+    ((nolock_count++))
+    echo "Unable to acquire flock: $nolock_count"
+    if [[ $nolock_count -gt 20 ]]; then  # about 1 hour
+      echo "Job appears to be locked."
+      exit 10
+    fi
+  fi  # if lock
+done  # While loop
+
+echo 'TIME'
+exit 20
